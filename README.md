@@ -1,57 +1,90 @@
+<div align="center">
+
 # dsh-session-pause
 
-DSH Web 的「暂停一切、下次恢复」profile bundle：在**发送/停止主按钮正左侧**（与其并列）提供暂停按钮，点击后优雅地排干当前执行（等最后一条 API 请求回答完、当前步骤内所有工具/命令行任务跑完），把会话完整落盘，按钮变为**继续按钮**；点击继续（或重启 DSH 后重新打开该会话再点继续）即从暂停点续跑。**不修改任何 DSH 代码**——整个功能是一个即装即用的 profile bundle。
+**让 DeepSeek Harness 随时「暂停一切」，稍后无缝接着跑**
 
-## 行为
+[![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg)](LICENSE)
+[![DeepSeek Harness](https://img.shields.io/badge/DeepSeek%20Harness-web%20bundle-4f46e5.svg)](https://github.com/watericetangcw/dsh-session-pause)
 
-- **暂停（持久请求，永不放弃）**：点击后按钮转圈，暂停请求成为 agent 级持久 latch：不中断任何进行中的请求或工具；当前 step 到达边界后该轮以 `turn/end` reason `"paused"` 关闭、flush 落盘、agent 进入 `paused` 状态。若本轮先以其他方式结束（回答完成、max-tokens、被停止、出错），**请求不会放弃**——转圈持续，下一次运行会在其第一个步骤边界暂停。
-- **取消暂停**：转圈期间鼠标悬停按钮 → 图标变为"取消暂停"（✕），移出恢复转圈；点击即取消（`/pause-cancel`），后续运行恢复正常。**1 秒防连击缓冲**：点击暂停后 1 秒内取消点击被忽略（悬停图标以降低不透明度提示未就绪）。
-- **继续**：打开下一个 turn 并跳过「空输入即结束」的保护，模型基于**持久化的工具结果尾**继续原任务——语义上等价于从未暂停。暂停期间排队的新消息会随继续一起被认领。
-- **重启恢复**：会话日志中最后的 `turn/end` reason 为 `"paused"` 时，恢复出的 agent 直接进入 paused 状态（不自动续跑），继续按钮照常工作。**armed 未暂停的请求不跨重启**（live-process 意图，文档化）。
-- **停止 ≠ 取消暂停**：排干期间点停止只中止当前运行，转圈继续等待下一次可暂停时机。
-- **goal 自动轮次**：`goal-round-driver` 只在 `idle` 时驱动，paused 状态天然阻断自动轮次；继续跑完后自动恢复。
-- **持久化**：全部状态都在既有 session JSONL 中（消息、chunk、每次请求头/上下文、工具调用与结果、排队输入 splices），由 `session-checkpoint-policy` 与暂停完成时的显式 flush 保证落盘；本 bundle 不新增任何存储格式。
+**[English](README.en.md) · 简体中文**
 
-## 组成
+</div>
 
-- `lib/agent-loop.js` — fork 自 `@deepseek-ai/dsh-agent-loop@0.1.0-rc.6`，加入暂停核心（所有改动点带 `// PAUSE` 标记，便于升级时 re-sync）。由 bundle patch 禁用基础 `agent-loop` 行、插入 fork 行 `agent-loop-pause`。
-- `lib/index.js`（host）— 注册全局 `/pause`、`/pause-cancel`、`/resume` 命令与 `pause` session 投影（`{paused:boolean}`，由日志折叠而来）。
-- `lib/client.js`（client）— 在 `conversation.input.right` 槽位注册按钮，再用插件自有 CSS 定位到主按钮正左侧：`position:absolute; right:calc(34px + 12px + 8px)`（发送按钮宽 34 + trailing 间距 12 + 行右内边距 8；锚点是 `position:relative` 的 composer 卡片），`top:auto` 使其保持与按钮行同高的静态垂直位置。上游 UI 改版若改变这些常量，改插件内 `PAUSE_RIGHT_OFFSET` 一个变量即可。
+一次安装，永久可用：点击发送按钮旁边的 **⏸ 暂停**，等当前这一轮优雅收尾（回答写完、所有工具跑完）后，把会话完整落盘——随时关闭、重启 DSH 都行，回来点 **▶ 继续** 即可从暂停点接着跑，就像从来没停过。**不改动任何 DSH 代码**，整个功能就是一个即装即用的 profile bundle。
 
-## 安装 / 卸载
+## ✨ 功能亮点
+
+### ⏸ 一键暂停
+
+发送/停止主按钮**正左侧**新增一枚暂停按钮：点击后不打断任何进行中的请求，当前步骤到达边界后这轮以 `paused` 优雅关停，紧接着自动落盘——按钮随即变成**继续按钮**。
+
+### 💾 完整持久化
+
+暂停 = 全程落盘：消息、chunk、工具调用与结果、请求上下文全部写进既有会话 JSONL，**不新增任何存储格式**。因此只要 DSH 还在，随时回来都能继续。
+
+### 🔄 重启也能恢复
+
+会话日志里最后一轮以 `paused` 结束时，重启 DSH 后重新打开该会话，agent 会直接回到暂停状态，继续按钮照常工作——**关掉 DSH、甚至换机器继续，都不会丢进度**。
+
+### 🛑 排干中的三件小事
+
+| 操作 | 效果 |
+| --- | --- |
+| 悬停转圈中的按钮 | 图标临时变成 ✕，移开恢复 |
+| 点击 ✕（取消暂停） | 解除暂停请求，后续运行恢复正常 |
+| 点停止 | **不会**取消暂停——只中止当前这轮，转圈继续等下一次可暂停时机 |
+
+> 停顿期间 agent 进入 `paused` 状态，goal 自动轮次天然不启动；继续跑完后自动恢复。
+
+## 🚀 快速安装
+
+一条命令即可：
 
 ```powershell
-# 安装（pnpm link + 自动写入 dsh.profile.bundles）
-dsh plugin --profile web add "link:D:/HOBBY/20260816_DSH_暂停/dsh-pause"
+dsh plugin --profile web add github:watericetangcw/dsh-session-pause
+```
 
-# 卸载（恢复原生 agent-loop 行为）
+安装完成后重启 `dsh web`，并刷新一次浏览器页面，即可使用。
+
+<details>
+<summary>卸载</summary>
+
+```powershell
 dsh plugin --profile web remove dsh-session-pause
 ```
 
-安装后重启 `dsh web` 生效（正在运行中的 DSH 进程不会热加载新组合）。
+卸载后重启 `dsh web`，恢复原生 agent-loop 行为。
 
-## 依赖解析（开发/运行时）
+</details>
 
-fork 与 host 插件 import `@deepseek-ai/*`，通过本包根目录的 `node_modules` 目录解析。仓库内已建立一个指向当前 DSH 安装的 junction；若 DSH 安装位置变化（如 npx 缓存被清理后重装），重新执行：
+## 🧪 快速体验
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/relink.ps1
-```
+安装后，给 DSH 一个会用到工具的长任务，跑起来后：
 
-（`file:`/npm 方式安装的用户不需要 junction，依赖由 pnpm 正常解析。）
+**① 暂停再继续**
 
-## 测试
+点发送按钮左侧的 ⏸ → 等转圈结束、按钮变成 ▶ → 再点 ▶，模型会基于持久化的工具结果接着完成原任务，语义上等同于从未暂停。
 
-```powershell
-node test/pause-loop.mjs     # 9 个场景 60 断言：排干/流式排干/重启恢复/latch 不放弃/命令与投影/排干中停止/排队输入/取消/空闲武装
-node test/api-smoke.mjs      # 需要运行中的测试实例（见脚本头部），真实模型冒烟
-```
+**② 重启后继续**
 
-## 限制（见 notes/design.md）
+暂停后直接重启 `dsh web`，重新打开刚才的会话 → 它已经是暂停状态，点 ▶ 即可从暂停点续跑。
 
-- 暂停等待整个当前步骤（含其全部工具调用）完成；超长工具会让转圈持续（停止仅中止本轮，转圈继续等待；取消暂停可解除）。
-- 排干期间挂起的审批/`ask_user_question` 会阻塞步骤完成（先答复、停止或取消暂停）。
-- 排干中崩溃/杀进程：该轮按现有 crash-repair 记为 `interrupted`，不提供继续（先等转圈结束再关机）。
-- 后台 jobs（`run_in_background`）按设计脱离 turn，不受暂停影响。
-- fork 锁定 agent-loop 于 0.1.0-rc.6 行为；升级 DSH 后按 `// PAUSE` 标记 re-sync。
-- 按钮定位依赖上游 4 个 CSS 常量（单点可调）；纯文本回合没有"步骤边界"，latch 会一直等到下一次出现工具步骤的可暂停时机（符合"等待时机"语义）。
+**③ 暂停中又排队了消息？**
+
+暂停期间发的新消息会留在会话里，继续时一起被认领，不会丢。
+
+## 📖 使用方式
+
+- **暂停**：运行中点 ⏸（或输入 `/pause`）；空闲时也能武装请求，让下一次运行在第一个步骤边界暂停。
+- **取消暂停**：转圈中悬停按钮 → 点 ✕（或 `/pause-cancel`）。
+- **继续**：暂停后点 ▶（或 `/resume`）。
+- **命令**：`/pause`、`/pause-cancel`、`/resume` 均可直接从斜杠菜单调用。
+
+## 🔗 链接
+
+- 仓库：[github.com/watericetangcw/dsh-session-pause](https://github.com/watericetangcw/dsh-session-pause)
+
+## 📄 许可证
+
+[MIT](LICENSE) © 2026 WateRice
