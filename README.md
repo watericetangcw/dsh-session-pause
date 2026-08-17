@@ -47,6 +47,8 @@ dsh plugin --profile web add github:watericetangcw/dsh-session-pause
 
 安装完成后重启 `dsh web`，并刷新一次浏览器页面，即可使用。
 
+> 本 bundle **有意不携带任何可安装的 `@deepseek-ai/*` 运行时依赖**：运行时它的 host 半部分会从 DSH 安装目录本身解析这些包（共享同一份模块实例），从而与部署的 presets / scope / session 服务保持身份一致。请通过 `dsh plugin add`（如上）安装，不要把该包当作普通库 `npm install` 进 profile。
+
 <details>
 <summary>卸载</summary>
 

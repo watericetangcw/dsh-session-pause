@@ -9,6 +9,22 @@
 
 纯外部插件无法无痕实现这两点（合成空消息会污染模型转录，preStep reject 会把 turn 记成 `blocked`），所以本 bundle 携带 agent-loop 的 fork（`lib/agent-loop.js`），由 bundle patch 禁用基础行、插入 fork 行。fork 的所有改动点都有 `// PAUSE` 标记，升级时照清单搬运即可。
 
+## 依赖契约：bundle 禁止携带可安装的 DSH 运行时依赖
+
+**教训（曾经的线上 bug）**：`dsh plugin add` 只是把参数转发给 profile 目录里的 `pnpm add`。如果 bundle 的 `package.json` 把任何 `@deepseek-ai/*` 包声明为普通 `dependencies`，pnpm 会在 profile 的 node_modules 里物化出这些包的**第二份模块实例**。fork 用这份副本的 `createScope` 给 agent ctx 打 scope 标签，而部署自带的 `dsh-agent-presets` 用自己副本的 `scopeOf` 读取——两个副本的私有 `kScope` Symbol 不是同一个，`scopeOf(agentCtx)` 恒为 `undefined`，于是每次创建会话都报：
+
+```
+agent-presets: refusing to compose an unscoped context; the scope key is what joins an agent to its preset
+```
+
+连带症状：新会话页选工作区/preset 立即闪跳回旧值（选择动作触发的 `session.create` 失败后 UI 回退）、新工作区无法创建会话。同理 `Service`/`SessionPreparation` 等 class 身份也会分裂，只是 scope 标签最先被踩到。
+
+**规则**：
+- `package.json` 的 `dependencies` 必须为空。`@deepseek-ai/*` 包只允许放在 `devDependencies`（供本地开发/测试解析，`files` 白名单本就不打包 node_modules，消费方不会安装 devDeps），且**不要**声明为 `peerDependencies`（其他 pnpm 配置可能自动安装 peer，同样物化副本）。
+- 运行时解析依赖 DSH 安装目录的 flat fallback：Node 沿父目录向上找到 `$DSH_HOME/profiles/node_modules`，那里是安装依赖闭包每个包的 junction/symlink（由 `healProfilesModuleFallback` 在 boot 时维护），指向部署唯一实例——fork 与 `dsh-agent-presets` 因此共享同一份 `dsh-scope`。
+- fork 新增 import 前先确认目标包在部署依赖闭包内（能解析即证明在闭包内；否则 boot 时以明确模块解析错误失败，属于期望的 fail-loud 行为）。
+- `test/dependency-contract.mjs` 静态断言 `dependencies` 为空并扫描 `lib/*.js` 的全部 import 都落在 devDependencies（或客户端模块表 `react`），运行时断言部署 `scopeOf` 能读到 fork 创建的 agent scope key——两重防回归。
+
 ## 暂停语义（fork 内部）
 
 - **持久 latch**：`pauseRequested`/`pauseDone` 是 agent 级字段（不是运行相位上的临时标志）。`pause()` 幂等置位并返回 promise（idle 时也允许，等待下一次运行）；`pauseCancel()` 清位并以 `{paused:false, cancelled:true}` 结算。

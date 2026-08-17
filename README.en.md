@@ -47,6 +47,8 @@ dsh plugin --profile web add github:watericetangcw/dsh-session-pause
 
 Then restart `dsh web` and refresh the browser page once.
 
+> The bundle ships **no installable `@deepseek-ai/*` dependencies on purpose**: at runtime its host half resolves those packages from the DSH installation itself (the shared module instances), so the forked agent loop stays identity-compatible with the deployment's presets, scope, and session services. Install it through `dsh plugin add` (as above) — do not `npm install` it as a plain library into a profile.
+
 <details>
 <summary>Uninstall</summary>
 
