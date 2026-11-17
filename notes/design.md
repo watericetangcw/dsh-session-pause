@@ -21,7 +21,8 @@ agent-presets: refusing to compose an unscoped context; the scope key is what jo
 
 **规则**：
 - `package.json` 的 `dependencies` 必须为空。`@deepseek-ai/*` 包只允许放在 `devDependencies`（供本地开发/测试解析，`files` 白名单本就不打包 node_modules，消费方不会安装 devDeps），且**不要**声明为 `peerDependencies`（其他 pnpm 配置可能自动安装 peer，同样物化副本）。
-- 运行时解析依赖 DSH 安装目录的 flat fallback：Node 沿父目录向上找到 `$DSH_HOME/profiles/node_modules`，那里是安装依赖闭包每个包的 junction/symlink（由 `healProfilesModuleFallback` 在 boot 时维护），指向部署唯一实例——fork 与 `dsh-agent-presets` 因此共享同一份 `dsh-scope`。
+- 运行时解析依赖 DSH 的**进程内模块解析拦截表**（0.2.1-rc.5 起；旧版 `healProfilesModuleFallback` 已从部署中删除，实测全仓零命中）：`installRuntimeInterception`（`dsh-app-boot`）把安装依赖闭包登记为 `scope: "installation"` 条目，`routeScoped` 在解析时先看 profile 本地候选、再查该表并路由到安装实例——fork 与 `dsh-agent-presets` 因此共享同一份 `dsh-scope`。
+- 注意本机遗留物：`$DSH_HOME/profiles/node_modules` 这份旧 symlink 指向早期 `_npx` 实例，与当前部署是两份物理拷贝。正常 boot 会被拦截表纠正，但**脱离 boot 的脚本**会拿到另一份（正是 `kScope` 分裂的复现条件）。本地跑测试时把 `node_modules` 链接到**当前安装目录**，不要照搬 `scripts/relink.ps1` 里的旧路径。
 - fork 新增 import 前先确认目标包在部署依赖闭包内（能解析即证明在闭包内；否则 boot 时以明确模块解析错误失败，属于期望的 fail-loud 行为）。
 - `test/dependency-contract.mjs` 静态断言 `dependencies` 为空并扫描 `lib/*.js` 的全部 import 都落在 devDependencies（或客户端模块表 `react`），运行时断言部署 `scopeOf` 能读到 fork 创建的 agent scope key——两重防回归。
 
@@ -32,7 +33,12 @@ agent-presets: refusing to compose an unscoped context; the scope key is what jo
 - **不放弃**：任何其他结局（completed / max-tokens / aborted / error / blocked）→ 转 idle，**不 resolve、不清 latch**；promise 保持 pending，下一次运行在其第一个步骤边界暂停（每轮最多跑一个 step 即暂停）。停止（`cancel({kind:'user'})`）不清 latch——停止 ≠ 取消暂停；仅 `disposed` 拆卸时结算清理。
 - **继续**：`resume()`（paused → running，携带一次性 `resumePending`）跳过空输入保护；派生历史自带工具结果尾，模型直接续答；排队输入在同一边界被认领。latch 已被消费，续跑轮不会再次自动暂停。
 - **重启恢复**：构造函数读最后一条 `turn/end`，reason 为 `"paused"` 时初始 phase 即为 paused（不自动运行）。armed 未暂停的 latch 不跨重启。
-- **status 第三态 `"paused"`**：goal-round-driver 只在 idle 驱动 → 暂停期间自动轮次天然停止；`=== "running"` 的消费方（steer 可用性、subagent 活动）视作未运行。
+- **没有第三态**：`get status()` 把 paused 相位折进 `"idle"`。上游 `AgentStatus = 'idle' | 'running'` 且类型注释明确「不是第三种可观察状态」，`dsh-subagent` 的 `waitForChildren` 又用 `status !== "idle"` 判活跃——引入第三态会让被暂停的 subagent 永久等待。代价见下一条。
+- **goal 会话的额外轮次：已在插件内消除（无需 fork）**。因为暂停的 agent 读作 `idle`，`goal-round-driver` 的 `drivable()` 会认为它可以自动续轮，从而多排入一轮 goal 消息。插件在 `/pause` 时调用 `ctx.goals.disarm(agent)`，把该 agent 的进程级 `activation` 从 `armed` 摘掉——`drivable()` 要求 `phase === "active" && activation === "armed"`，条件不成立即不再排轮。
+  - **为什么用 `disarm` 而不是 `goals.pause()`**：后者会把持久 `phase` 也改成 `"paused"`，而那是**用户可见的目标状态**（goal 栏显示「已暂停的目标」）。会话暂停不应该悄悄改写用户的目标生命周期。`disarm` 只动进程级的续轮意图，正是「会话暂停」该挂起的东西；`phase` 保持 `"active"`。
+  - 恢复对称：`/resume` 在启动 driver **之前**调用 `goals.resume(agent, ref)` 把 `activation` 还原为 `armed`；`/pause-cancel` 同样还原（因为根本没停）。持有一份 `Map<agentId, {goalId, revision}>` 记录「是我摘掉的」，并用 id+revision 守卫——用户期间编辑或替换了目标则不还原，`agent/disposed` 时清理。
+  - 边界：无 goal 的会话完全不受影响（`goals.get()` 返回 `undefined` 即跳过）；goal 服务未挂载时 `ctx.get("goals")` 为 `undefined`，整段逻辑静默跳过；`disarm`/`resume` 失败只记 warn，**永不阻塞暂停本身**（最坏退化为「多一轮并自行再停」）。
+- 供 UI/命令判断「是否真暂停」的唯一正确来源：持久投影 `pause`（`{paused}`）或 `agent.paused`（活相位）。**不要**用 `agent.status === "paused"`——它永远是 false。
 - **守卫**：paused 相位无 abort controller——`wakeDriver` 直接返回（排队消息留给 resume）、`send` 不读 `phase.abort`、`cancel` 转回 idle（disposed 时静默赋值避免拆卸期触发 idle 事件）。
 
 ## 数据流

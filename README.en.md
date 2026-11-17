@@ -11,6 +11,11 @@
 
 </div>
 
+> **Compatibility**: this version targets `dsh@0.2.1-rc.5` (the bundled agent-loop fork is
+> aligned to that release). On any other dsh version it fails **silently** at startup —
+> module exports no longer match, so agent sessions stop working without an error.
+> Check `dsh --version` before installing.
+
 Install once, use forever: click **⏸ Pause** next to the send button, let the current turn finish gracefully (answer written, all tools run to completion), and the whole session is persisted — close or even restart DSH, come back and click **▶ Resume** to continue from the exact pause point, as if nothing ever stopped. **No DSH code is modified** — the entire feature is a drop-in profile bundle.
 
 ## ✨ Features

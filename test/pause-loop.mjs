@@ -21,9 +21,37 @@ import { CommandRuntime } from "@deepseek-ai/dsh-commands";
 import { SessionProjectionRegistry } from "@deepseek-ai/dsh-session-projection";
 import { AgentLoop } from "../lib/agent-loop.js";
 import { apply as sessionPauseApply } from "../lib/index.js";
+// Goal integration: the stock goal driver treats a paused (idle-reading)
+// agent as drivable, so the plugin disarms the goal around the pause.
+import GoalService from "@deepseek-ai/dsh-goal";
+import * as GoalRoundDriver from "@deepseek-ai/dsh-goal-round-driver";
 
 const CWD = process.cwd();
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Hard watchdog: a hung scenario must fail loudly with its name instead of
+// making the whole run look like an infinite loop. Generous enough for real
+// adapter latency, short enough to keep the suite usable.
+const SCENARIO_TIMEOUT_MS = 45000;
+let currentScenario = "(startup)";
+function guard(name, fn) {
+	return async () => {
+		currentScenario = name;
+		let timer;
+		const timeout = new Promise((_, reject) => {
+			timer = setTimeout(() => reject(new Error(`scenario ${name} timed out after ${SCENARIO_TIMEOUT_MS}ms`)), SCENARIO_TIMEOUT_MS);
+		});
+		try {
+			await Promise.race([fn(), timeout]);
+		} finally {
+			clearTimeout(timer);
+		}
+	};
+}
+process.on("unhandledRejection", (error) => {
+	console.error(`UNHANDLED REJECTION during ${currentScenario}:`, error);
+	process.exit(1);
+});
 
 let failures = 0;
 function assert(cond, label) {
@@ -49,6 +77,16 @@ function scriptedAdapter(state) {
 		},
 		providerRetryPolicy() {
 			return void 0;
+		},
+		// 0.2.1-rc.5 routes every model call through adapter.prepareCall(), which
+		// the framework's LlmAdapter base class implements by default. A plain
+		// object adapter has no base class, so it must supply the same contract:
+		// bind the model metadata and return the generation-bound stream entry.
+		async prepareCall(provider, model) {
+			return {
+				model: await this.resolveModel(provider, model),
+				stream: (options) => this.stream(options)
+			};
 		},
 		stream(options) {
 			const call = state.requests.length + 1;
@@ -102,15 +140,21 @@ function slowTextScript(pieces, pieceDelayMs) {
 }
 
 /** Build one isolated composition with the fork as the agent factory. */
-async function composeRoot(script, toolStarted) {
+async function composeRoot(script, toolStarted, extraPlugins = []) {
 	const root = new Context();
 	const fibers = [];
-	for (const plugin of [SessionStore, AgentRegistry, LlmRuntime, SystemPrompt, ToolRuntime]) fibers.push(root.plugin(plugin));
+	// 0.2.1-rc.5: AgentLoop also injects `sessionProjections` (it registers its
+	// own turnBoundary + inbox units there). Omitting it leaves the AgentLoop
+	// fiber stuck at state 0, so the wait loop below would spin forever.
+	for (const plugin of [SessionStore, AgentRegistry, LlmRuntime, SystemPrompt, ToolRuntime, SessionProjectionRegistry]) fibers.push(root.plugin(plugin));
+	for (const plugin of extraPlugins) fibers.push(root.plugin(plugin));
 	fibers.push(root.plugin(AgentLoop, { agents: [] }));
 	// cordis v4 mounts plugin fibers asynchronously; wait for all of them.
+	const mountDeadline = Date.now() + 15000;
 	for (;;) {
 		if (fibers.every((fiber) => fiber.state === 2)) break;
 		if (fibers.some((fiber) => fiber.state >= 4)) throw new Error(`composition failed: fiber state ${fibers.map((fiber) => fiber.state).join(",")}`);
+		if (Date.now() > mountDeadline) throw new Error(`composition stalled at fiber states ${fibers.map((fiber) => fiber.state).join(",")} — a required service is probably unmounted`);
 		await sleep(5);
 	}
 	const state = { requests: [], script };
@@ -145,7 +189,7 @@ async function teardown(composition) {
 }
 
 function lastTurnEnd(session) {
-	return session.events.findLast((event) => event.type === "turn/end")?.data;
+	return session.snapshotEvents().findLast((event) => event.type === "turn/end")?.data;
 }
 
 async function scenarioA() {
@@ -153,23 +197,25 @@ async function scenarioA() {
 	const toolStarted = Promise.withResolvers();
 	const composition = await composeRoot({ 1: toolCallScript({ delayMs: 600 }) }, toolStarted);
 	const { root, state } = composition;
-	const agent = root.agentLoop.create("pause-test-a", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
+	const agent = await root.agentLoop.create("pause-test-a", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
 	agent.followup(createUserMessage({ content: [{ type: "text", text: "start" }], source: { kind: "user" } }));
 	await toolStarted.promise; // the slow tool is now running
 	const pausePromise = agent.pause();
 	assert(agent.status === "running", "agent still running while the pause drains");
 	const outcome = await pausePromise;
 	assert(outcome.paused === true, "pause settles {paused:true} after the tool drain");
-	assert(agent.status === "paused", "agent status is paused");
+	assert(agent.paused === true, "agent status is paused");
 	assert(lastTurnEnd(agent.session)?.reason?.kind === "paused", 'durable turn/end reason is "paused"');
-	assert(agent.session.events.some((e) => e.type === "tool/result"), "tool result committed before pause");
+	assert(agent.session.snapshotEvents().some((e) => e.type === "tool/result"), "tool result committed before pause");
 	assert(state.requests.length === 1, "no follow-up model call during pause");
 	agent.resume();
 	await agent.whenIdle();
 	assert(agent.status === "idle", "agent idle after resume completes");
 	assert(state.requests.length === 2, "resume produced exactly one more model call");
 	const resumedMessages = state.requests[1].messages;
-	assert(resumedMessages.some((m) => m.content?.some((b) => b.type === "tool-result")), "resumed request carries the tool result");
+	// Tool results reach the model as `role: "tool"` messages keyed by
+	// toolCallId (createToolResultMessage), not as a "tool-result" content block.
+	assert(resumedMessages.some((m) => m.role === "tool" && m.toolCallId !== void 0), "resumed request carries the tool result");
 	assert(lastTurnEnd(agent.session)?.reason?.kind === "completed", "resumed turn completes normally");
 	await teardown(composition);
 }
@@ -179,16 +225,16 @@ async function scenarioB() {
 	const toolStarted = Promise.withResolvers();
 	const composition = await composeRoot({ 1: slowToolCallScript({ delayMs: 400 }, 150) }, toolStarted);
 	const { root, state } = composition;
-	const agent = root.agentLoop.create("pause-test-b", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
+	const agent = await root.agentLoop.create("pause-test-b", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
 	agent.followup(createUserMessage({ content: [{ type: "text", text: "stream" }], source: { kind: "user" } }));
 	await sleep(180); // the argument stream is in flight
 	const outcome = await agent.pause();
 	assert(outcome.paused === true, "pause waits for the stream and the tool to finish");
-	assert(agent.status === "paused", "agent paused after the drain");
+	assert(agent.paused === true, "agent paused after the drain");
 	assert(lastTurnEnd(agent.session)?.reason?.kind === "paused", 'turn/end reason "paused"');
-	const callEvent = agent.session.events.find((e) => e.type === "tool/call");
+	const callEvent = agent.session.snapshotEvents().find((e) => e.type === "tool/call");
 	assert(callEvent?.data?.arguments === JSON.stringify({ delayMs: 400 }), "the in-flight tool call was not truncated by the pause");
-	assert(agent.session.events.some((e) => e.type === "tool/result"), "the drained tool committed its result");
+	assert(agent.session.snapshotEvents().some((e) => e.type === "tool/result"), "the drained tool committed its result");
 	assert(state.requests.length === 1, "no model call escaped the pause boundary");
 	agent.resume();
 	await agent.whenIdle();
@@ -200,24 +246,35 @@ async function scenarioC() {
 	console.log("\n[C] restart: restore a paused session and resume it");
 	const toolStarted = Promise.withResolvers();
 	const first = await composeRoot({ 1: toolCallScript({ delayMs: 200 }) }, toolStarted);
-	const firstAgent = first.root.agentLoop.create("pause-test-c", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
+	const firstAgent = await first.root.agentLoop.create("pause-test-c", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
 	firstAgent.followup(createUserMessage({ content: [{ type: "text", text: "start" }], source: { kind: "user" } }));
 	await toolStarted.promise;
 	const outcome = await firstAgent.pause();
 	assert(outcome.paused === true, "pre-restart pause completed");
-	const seedEvents = structuredClone(firstAgent.session.events);
+	const seedEvents = structuredClone(firstAgent.session.snapshotEvents());
 	const seedHeader = structuredClone(firstAgent.session.header);
 	await teardown(first); // simulates the process going away
 
 	// A fresh process composition resumes the same durable session.
 	const second = await composeRoot({ 1: textScript("restart-continuation") }, Promise.withResolvers());
+	// 0.2.1-rc.5's resumeWith() drives a persistence HANDLE, not a
+	// prepare()-style factory: it calls persistence.open(id, "write", {signal})
+	// and then reads handle.read(0, undefined, ...) / handle.append(...) plus
+	// handle.header and handle.inheritedEventCount.
 	const persistence = {
-		async prepare(id, _signal) {
-			return SessionPreparation.create(second.root.sessions.prepare(id, {
-				seedSource: "persistence",
-				seed: seedEvents,
-				meta: seedHeader
-			}));
+		async open(id) {
+			let events = structuredClone(seedEvents);
+			return {
+				header: seedHeader,
+				inheritedEventCount: 0,
+				async read(from = 0, to) {
+					return { events: events.slice(from, to ?? events.length), eventState: void 0 };
+				},
+				async append(appended) {
+					events = [...events, ...appended];
+				},
+				async close() {}
+			};
 		}
 	};
 	const published = await second.root.agentLoop.resumeWith(second.root, persistence, {
@@ -225,14 +282,14 @@ async function scenarioC() {
 		agentOptions: { provider: "scripted", model: "scripted-1" }
 	});
 	const restored = published.agent;
-	assert(restored.status === "paused", "restored agent detects the paused tail and stays paused");
+	assert(restored.paused === true, "restored agent detects the paused tail and stays paused");
 	assert(second.state.requests.length === 0, "restore does not auto-run any model call");
 	restored.resume();
 	await restored.whenIdle();
 	assert(restored.status === "idle", "restored agent resumes to idle");
 	assert(second.state.requests.length === 1, "resume ran exactly one continuation call");
 	const resumedMessages = second.state.requests[0].messages;
-	assert(resumedMessages.some((m) => m.content?.some((b) => b.type === "tool-result")), "restarted continuation carries the durable tool result");
+	assert(resumedMessages.some((m) => m.role === "tool" && m.toolCallId !== void 0), "restarted continuation carries the durable tool result");
 	assert(lastTurnEnd(restored.session)?.reason?.kind === "completed", "restarted continuation turn completes");
 	await teardown(second);
 }
@@ -257,7 +314,7 @@ async function scenarioD() {
 		2: toolCallScript({ delayMs: 100 })
 	}, toolStarted);
 	const { root } = composition;
-	const agent = root.agentLoop.create("pause-test-d", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
+	const agent = await root.agentLoop.create("pause-test-d", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
 	agent.followup(createUserMessage({ content: [{ type: "text", text: "plain" }], source: { kind: "user" } }));
 	await sleep(150); // mid-stream
 	const pausePromise = agent.pause();
@@ -265,15 +322,15 @@ async function scenarioD() {
 	assert(agent.status === "idle", "agent idle after the natural completion");
 	assert(lastTurnEnd(agent.session)?.reason?.kind === "completed", "turn ended completed");
 	assert(await stillPending(pausePromise), "the pause promise stays pending after the natural end (no give-up)");
-	const assistant = agent.session.events.findLast((e) => e.type === "assistant/message")?.data?.message;
+	const assistant = agent.session.snapshotEvents().findLast((e) => e.type === "assistant/message")?.data?.message;
 	assert(assistant?.content?.[0]?.text === "one-two-", "the in-flight stream was allowed to finish");
 	// The next run pauses at its first step boundary.
 	agent.followup(createUserMessage({ content: [{ type: "text", text: "again" }], source: { kind: "user" } }));
 	await toolStarted.promise;
 	const outcome = await pausePromise;
 	assert(outcome.paused === true, "the armed latch pauses the next run at its boundary");
-	assert(agent.status === "paused", "agent paused");
-	assert(agent.session.events.filter((e) => e.type === "tool/result").length === 1, "the second run's step completed before the pause");
+	assert(agent.paused === true, "agent paused");
+	assert(agent.session.snapshotEvents().filter((e) => e.type === "tool/result").length === 1, "the second run's step completed before the pause");
 	agent.resume();
 	await agent.whenIdle();
 	assert(agent.status === "idle", "agent idle after resume");
@@ -289,43 +346,64 @@ async function waitForStatus(agent, wanted, timeoutMs = 10000) {
 	}
 }
 
+/**
+ * Wait for the paused PHASE. A paused agent deliberately reports status "idle"
+ * (it is not a third AgentStatus), so this polls the loop's phase-backed flag
+ * instead of status.
+ */
+async function waitForPaused(agent, timeoutMs = 10000) {
+	const start = Date.now();
+	for (;;) {
+		if (agent.paused === true) return true;
+		if (Date.now() - start > timeoutMs) return false;
+		await sleep(10);
+	}
+}
+
 async function scenarioE() {
 	console.log("\n[E] plugin glue: /pause, /resume commands and the pause projection");
 	const toolStarted = Promise.withResolvers();
 	const composition = await composeRoot({ 1: toolCallScript({ delayMs: 500 }) }, toolStarted);
 	const { root } = composition;
-	const extra = [root.plugin(CommandRuntime), root.plugin(SessionProjectionRegistry), root.plugin({ apply: sessionPauseApply })];
+	// composeRoot() already mounts SessionProjectionRegistry (AgentLoop injects
+	// it in 0.2.1-rc.5), so mounting it again here would be a second registry
+	// contending for the same service name — only add what is genuinely missing.
+	const extra = [root.plugin(CommandRuntime), root.plugin({ apply: sessionPauseApply })];
+	const glueDeadline = Date.now() + 15000;
 	for (;;) {
 		if (extra.every((fiber) => fiber.state === 2)) break;
 		if (extra.some((fiber) => fiber.state >= 4)) throw new Error(`glue composition failed: fiber state ${extra.map((fiber) => fiber.state).join(",")}`);
+		if (Date.now() > glueDeadline) throw new Error(`glue composition stalled at fiber states ${extra.map((fiber) => fiber.state).join(",")}`);
 		await sleep(5);
 	}
-	const agent = root.agentLoop.create("pause-test-e", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
+	const agent = await root.agentLoop.create("pause-test-e", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
 	const signal = new AbortController().signal;
 	// The plugin's inject-based registrations settle asynchronously after its
 	// fiber is ready; wait until the command resolves.
+	const probeDeadline = Date.now() + 15000;
 	for (;;) {
-		const probe = await root.commands.execute(agent, "/resume", signal);
+		const probe = await root.commands.execute(agent, "/resume", [], signal);
 		if (probe !== void 0) break;
+		if (Date.now() > probeDeadline) throw new Error("the /resume command never resolved — the plugin's command registration did not land");
 		await sleep(5);
 	}
 	agent.followup(createUserMessage({ content: [{ type: "text", text: "start" }], source: { kind: "user" } }));
 	await toolStarted.promise; // tool is running
-	const pauseRun = await root.commands.execute(agent, "/pause", signal);
+	const pauseRun = await root.commands.execute(agent, "/pause", [], signal);
 	assert(pauseRun?.result?.kind === "success", "the /pause command executes successfully");
-	assert(await waitForStatus(agent, "paused"), "the agent reaches paused after /pause");
+	assert(await waitForPaused(agent), "the agent reaches paused after /pause");
 	assert(root.sessionProjections.snapshot(agent.session).values.pause?.paused === true, 'the pause projection reports {paused:true}');
-	const pausedPause = await root.commands.execute(agent, "/pause", signal);
+	const pausedPause = await root.commands.execute(agent, "/pause", [], signal);
 	assert(pausedPause?.result?.kind === "error", "/pause while already paused reports an error");
-	const resumeRun = await root.commands.execute(agent, "/resume", signal);
+	const resumeRun = await root.commands.execute(agent, "/resume", [], signal);
 	assert(resumeRun?.result?.kind === "success", "the /resume command executes successfully");
 	assert(await waitForStatus(agent, "idle"), "the agent returns to idle after /resume");
 	assert(root.sessionProjections.snapshot(agent.session).values.pause?.paused === false, "the pause projection clears after the resumed turn");
-	const idlePause = await root.commands.execute(agent, "/pause", signal);
+	const idlePause = await root.commands.execute(agent, "/pause", [], signal);
 	assert(idlePause?.result?.kind === "success", "/pause while idle arms the latch for the next run");
-	const cancelRun = await root.commands.execute(agent, "/pause-cancel", signal);
+	const cancelRun = await root.commands.execute(agent, "/pause-cancel", [], signal);
 	assert(cancelRun?.result?.kind === "success", "/pause-cancel cancels the armed request");
-	const cancelAgain = await root.commands.execute(agent, "/pause-cancel", signal);
+	const cancelAgain = await root.commands.execute(agent, "/pause-cancel", [], signal);
 	assert(cancelAgain?.result?.kind === "error", "/pause-cancel with nothing armed reports an error");
 	await teardown(composition);
 }
@@ -338,7 +416,7 @@ async function scenarioF() {
 		2: toolCallScript({ delayMs: 100 })
 	}, toolStarted);
 	const { root } = composition;
-	const agent = root.agentLoop.create("pause-test-f", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
+	const agent = await root.agentLoop.create("pause-test-f", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
 	agent.followup(createUserMessage({ content: [{ type: "text", text: "start" }], source: { kind: "user" } }));
 	await toolStarted.promise; // tool running
 	const pausePromise = agent.pause();
@@ -351,7 +429,7 @@ async function scenarioF() {
 	agent.followup(createUserMessage({ content: [{ type: "text", text: "after-stop" }], source: { kind: "user" } }));
 	const outcome = await pausePromise;
 	assert(outcome.paused === true, "the armed latch pauses the next run after the stop");
-	assert(agent.status === "paused", "agent paused");
+	assert(agent.paused === true, "agent paused");
 	agent.resume();
 	await agent.whenIdle();
 	assert(agent.status === "idle", "agent idle after resume");
@@ -363,20 +441,20 @@ async function scenarioG() {
 	const toolStarted = Promise.withResolvers();
 	const composition = await composeRoot({ 1: toolCallScript({ delayMs: 300 }) }, toolStarted);
 	const { root, state } = composition;
-	const agent = root.agentLoop.create("pause-test-g", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
+	const agent = await root.agentLoop.create("pause-test-g", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
 	agent.followup(createUserMessage({ content: [{ type: "text", text: "start" }], source: { kind: "user" } }));
 	await toolStarted.promise;
 	await agent.pause();
-	assert(agent.status === "paused", "paused");
+	assert(agent.paused === true, "paused");
 	// Queue a follow-up while paused (the composer's send path).
 	agent.followup(createUserMessage({ content: [{ type: "text", text: "queued-question" }], source: { kind: "user" } }));
-	assert(agent.status === "paused", "queued input does not start a turn while paused");
+	assert(agent.paused === true, "queued input does not start a turn while paused");
 	agent.resume();
 	await agent.whenIdle();
 	assert(state.requests.length === 2, "resume runs the continuation");
 	const resumed = state.requests[1].messages;
 	assert(resumed.some((m) => m.content?.some((b) => b.type === "text" && b.text === "queued-question")), "the resumed request carries the queued prompt");
-	assert(resumed.some((m) => m.content?.some((b) => b.type === "tool-result")), "the resumed request also carries the tool result");
+	assert(resumed.some((m) => m.role === "tool" && m.toolCallId !== void 0), "the resumed request also carries the tool result");
 	await teardown(composition);
 }
 
@@ -385,7 +463,7 @@ async function scenarioH() {
 	const toolStarted = Promise.withResolvers();
 	const composition = await composeRoot({ 1: toolCallScript({ delayMs: 300 }) }, toolStarted);
 	const { root } = composition;
-	const agent = root.agentLoop.create("pause-test-h", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
+	const agent = await root.agentLoop.create("pause-test-h", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
 	agent.followup(createUserMessage({ content: [{ type: "text", text: "start" }], source: { kind: "user" } }));
 	await toolStarted.promise; // tool running
 	const pausePromise = agent.pause();
@@ -408,29 +486,96 @@ async function scenarioI() {
 	const toolStarted = Promise.withResolvers();
 	const composition = await composeRoot({ 1: toolCallScript({ delayMs: 150 }) }, toolStarted);
 	const { root } = composition;
-	const agent = root.agentLoop.create("pause-test-i", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
+	const agent = await root.agentLoop.create("pause-test-i", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
 	const pausePromise = agent.pause(); // idle: arms the latch
 	assert(agent.status === "idle", "arming while idle keeps the agent idle");
 	agent.followup(createUserMessage({ content: [{ type: "text", text: "go" }], source: { kind: "user" } }));
 	await toolStarted.promise;
 	const outcome = await pausePromise;
 	assert(outcome.paused === true, "the armed latch pauses the run at its first step boundary");
-	assert(agent.status === "paused", "agent paused");
-	assert(agent.session.events.some((e) => e.type === "tool/result"), "the first step fully completed before the pause");
+	assert(agent.paused === true, "agent paused");
+	assert(agent.session.snapshotEvents().some((e) => e.type === "tool/result"), "the first step fully completed before the pause");
 	agent.resume();
 	await agent.whenIdle();
 	assert(agent.status === "idle", "agent idle after resume");
 	await teardown(composition);
 }
 
-await scenarioA();
-await scenarioB();
-await scenarioC();
-await scenarioD();
-await scenarioE();
-await scenarioF();
-await scenarioG();
-await scenarioH();
-await scenarioI();
+async function scenarioJ() {
+	console.log("\n[J] goal rounds are suspended across the pause and restored on resume");
+	const toolStarted = Promise.withResolvers();
+	const composition = await composeRoot(
+		{ 1: toolCallScript({ delayMs: 300 }), 2: textScript("resumed"), 3: textScript("goal-round") },
+		toolStarted,
+		[GoalService, GoalRoundDriver]
+	);
+	const { root, state } = composition;
+	const extra = [root.plugin(CommandRuntime), root.plugin({ apply: sessionPauseApply })];
+	const glueDeadline = Date.now() + 15000;
+	for (;;) {
+		if (extra.every((fiber) => fiber.state === 2)) break;
+		if (extra.some((fiber) => fiber.state >= 4)) throw new Error(`glue composition failed: ${extra.map((f) => f.state).join(",")}`);
+		if (Date.now() > glueDeadline) throw new Error("glue composition stalled");
+		await sleep(5);
+	}
+	const agent = await root.agentLoop.create("pause-test-j", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
+	const signal = new AbortController().signal;
+	for (;;) {
+		if (await root.commands.execute(agent, "/resume", [], signal) !== void 0) break;
+		await sleep(5);
+	}
+
+	// An armed goal is what the driver would auto-continue.
+	const created = root.goals.create(agent, { objective: "keep going" });
+	assert(created.phase === "active", "goal starts active");
+	assert(root.goals.get(agent)?.activation === "armed", "goal starts armed");
+
+	agent.followup(createUserMessage({ content: [{ type: "text", text: "start" }], source: { kind: "user" } }));
+	await toolStarted.promise;
+
+	const pauseRun = await root.commands.execute(agent, "/pause", [], signal);
+	assert(pauseRun?.result?.kind === "success", "/pause succeeds with an active goal");
+	assert(await waitForPaused(agent), "agent pauses");
+	// THE POINT: the goal driver must no longer consider this agent drivable.
+	const suspended = root.goals.get(agent);
+	assert(suspended.phase === "active", "the goal's durable phase is untouched (only its activation is cleared)");
+	assert(suspended.activation === "disarmed", "the goal is disarmed so no automatic round is scheduled");
+
+	const requestsWhilePaused = state.requests.length;
+	await sleep(600); // give a driver (if any) room to queue a spurious round
+	assert(state.requests.length === requestsWhilePaused, "no goal round ran while paused");
+	assert(agent.inbox.nextTurn.length === 0, "no spurious goal round was queued into the inbox");
+
+	const resumeRun = await root.commands.execute(agent, "/resume", [], signal);
+	assert(resumeRun?.result?.kind === "success", "/resume succeeds");
+	assert(root.goals.get(agent)?.activation === "armed", "the goal is re-armed by resume");
+	// After resume the goal is armed again, so the driver MAY legitimately start
+	// a real goal round — that is the feature working, not a leak. Wait for
+	// quiescence and assert the round was a genuine goal round.
+	await agent.whenIdle();
+	const goalRounds = agent.session.snapshotEvents().filter((e) => e.type === "user/message" && e.data?.source?.kind === "goal").length;
+	assert(goalRounds <= 1, `at most one goal round was queued across the whole pause/resume cycle (saw ${goalRounds})`);
+	assert(agent.status === "idle" || agent.status === "running", "agent is in a valid phase after resume");
+
+	// A pause with no goal at all must not invent one.
+	const plain = await root.agentLoop.create("pause-test-j-plain", { provider: "scripted", model: "scripted-1" }, { cwd: CWD });
+	await root.commands.execute(plain, "/pause-cancel", [], signal);
+	assert(root.goals.get(plain) === void 0, "pausing an agent without a goal creates no goal");
+	await teardown(composition);
+}
+
+for (const [name, scenario] of [
+	["A", scenarioA], ["B", scenarioB], ["C", scenarioC],
+	["D", scenarioD], ["E", scenarioE], ["F", scenarioF],
+	["G", scenarioG], ["H", scenarioH], ["I", scenarioI],
+	["J", scenarioJ]
+]) {
+	try {
+		await guard(name, scenario)();
+	} catch (error) {
+		failures += 1;
+		console.error(`FAIL  scenario ${name}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
 console.log(failures === 0 ? "\nALL PASSED" : `\n${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

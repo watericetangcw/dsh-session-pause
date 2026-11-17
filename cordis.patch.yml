@@ -1,12 +1,27 @@
 # dsh-session-pause bundle patch — pause everything, resume later.
-# Applied after the web-app layer (bundle order comes from the profile's
+# Applied after the base/web-app layers (bundle order comes from the profile's
 # dsh.profile.bundles list).
 
-# The pause-capable agent loop replaces the stock factory. Both rows publish
-# the same `agentLoop` service, so the stock row must be disabled.
+# The pause-capable agent loop replaces the stock factory. Disabling the stock
+# row is NOT optional and NOT cosmetic: cordis' provide() *throws* when a
+# service name is already registered
+#   ("service \"agentLoop\" has been registered at <...>")
+# so both rows publishing `agentLoop` would leave one of them FAILED.
+#
+# ⚠ Failure mode worth knowing when debugging: the stock `agent-loop` id is in
+# dsh-app-boot's `requiredStartupEntryIds`, but the two ids we insert below are
+# NOT. Disabling the stock row also removes it from the startup audit (a
+# disabled entry is skipped, not counted as a failure), while an import failure
+# in `agent-loop-pause` only produces a warning. The net effect is that a broken
+# fork yields `dsh web` starting normally with NO agentLoop service at all —
+# every session dead, nothing fail-loud. Verify with a real session, not with a
+# clean startup log. See notes/upgrade-plan-0.2.1-rc5.md §5.0.
 - id: agent-loop
   disabled: true
 
+# No `id` here on purpose: a top-level `insert` list appends to the entry root,
+# whereas an `insert` WITH an id would push into that entry's `config` (and
+# requires the target to be a group).
 - insert:
     - id: agent-loop-pause
       name: 'dsh-session-pause/agent-loop'
