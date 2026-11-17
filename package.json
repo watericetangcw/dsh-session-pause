@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-pause",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DSH web bundle: pause the current turn at the next step boundary (graceful drain), persist everything, and resume later — including after a DSH restart.",
   "license": "MIT",
   "type": "module",
