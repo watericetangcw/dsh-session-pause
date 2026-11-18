@@ -5,7 +5,7 @@
 **让 DeepSeek Harness 随时「暂停一切」，稍后无缝接着跑**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg)](LICENSE)
-[![DeepSeek Harness](https://img.shields.io/badge/DeepSeek%20Harness-web%20bundle-4f46e5.svg)](https://github.com/watericetangcw/dsh-session-pause)
+[![DeepSeek Harness](https://img.shields.io/badge/DeepSeek%20Harness-web%20bundle-4f46e5.svg)](https://github.com/DL909/dsh-session-pause)
 
 **[English](README.en.md) · 简体中文**
 
@@ -39,14 +39,14 @@
 | 点击 ✕（取消暂停） | 解除暂停请求，后续运行恢复正常 |
 | 点停止 | **不会**取消暂停——只中止当前这轮，转圈继续等下一次可暂停时机 |
 
-> 停顿期间 agent 进入 `paused` 状态，goal 自动轮次天然不启动；继续跑完后自动恢复。
+> 停顿期间 agent 的对外状态仍是 `idle`（`paused` 只是内部相位，不是第三种 `AgentStatus`），因此插件会在暂停时主动摘下 goal 的自动续轮权限（`disarm`），继续时再恢复——不会多排一轮 goal 消息。
 
 ## 🚀 快速安装
 
 一条命令即可：
 
 ```powershell
-dsh plugin --profile web add github:watericetangcw/dsh-session-pause
+dsh plugin --profile web add github:DL909/dsh-session-pause
 ```
 
 安装完成后重启 `dsh web`，并刷新一次浏览器页面，即可使用。
@@ -89,7 +89,7 @@ dsh plugin --profile web remove dsh-session-pause
 
 ## 🔗 链接
 
-- 仓库：[github.com/watericetangcw/dsh-session-pause](https://github.com/watericetangcw/dsh-session-pause)
+- 仓库：[github.com/DL909/dsh-session-pause](https://github.com/DL909/dsh-session-pause)
 
 ## 📄 许可证
 
