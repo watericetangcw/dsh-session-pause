@@ -1,1 +1,11 @@
 /node_modules
+
+# Local meow-memory store for this workspace: machine-local runtime data
+# (SQLite + session logs), not part of the plugin source.
+/.dsh-meow/
+
+# The lockfile describes only the devDependency link target. The bundle ships
+# NO runtime dependencies on purpose (see notes/design.md "依赖契约") and is
+# consumed via `dsh plugin add`, where the profile's own pnpm settings resolve
+# @deepseek-ai/* from the DSH installation.
+/pnpm-lock.yaml

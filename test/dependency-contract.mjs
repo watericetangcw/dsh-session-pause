@@ -27,6 +27,10 @@ import { AgentRegistry } from "@deepseek-ai/dsh-agent";
 import { LlmRuntime } from "@deepseek-ai/dsh-llm";
 import { SystemPrompt } from "@deepseek-ai/dsh-system-prompt";
 import { ToolRuntime } from "@deepseek-ai/dsh-tools";
+// 0.2.1-rc.5: AgentLoop additionally injects `sessionProjections` (it
+// registers its own turnBoundary + inbox units against that registry).
+// Without this plugin the AgentLoop fiber stays at state 0 forever.
+import { SessionProjectionRegistry } from "@deepseek-ai/dsh-session-projection";
 import { scopeOf } from "@deepseek-ai/dsh-scope";
 import { AgentLoop } from "../lib/agent-loop.js";
 
@@ -76,19 +80,24 @@ assert(unresolved.length === 0, `every import is covered by devDependencies or t
 async function runtimeProbe() {
 	const root = new Context();
 	const fibers = [];
-	for (const plugin of [SessionStore, AgentRegistry, LlmRuntime, SystemPrompt, ToolRuntime]) fibers.push(root.plugin(plugin));
+	for (const plugin of [SessionStore, AgentRegistry, LlmRuntime, SystemPrompt, ToolRuntime, SessionProjectionRegistry]) fibers.push(root.plugin(plugin));
 	fibers.push(root.plugin(AgentLoop, { agents: [] }));
 	for (;;) {
 		if (fibers.every((fiber) => fiber.state === 2)) break;
 		if (fibers.some((fiber) => fiber.state >= 4)) throw new Error(`composition failed: fiber state ${fibers.map((fiber) => fiber.state).join(",")}`);
 		await sleep(5);
 	}
-	const agent = root.agentLoop.create("contract-probe", {
+	// 0.2.1-rc.5 made AgentLoop.create() async (it publishes through
+	// setupAndPublish), so the probe must await it before reading agent.ctx.
+	const agent = await root.agentLoop.create("contract-probe", {
 		provider: "contract",
 		model: "probe-1"
 	}, { cwd: process.cwd() });
 	assert(scopeOf(agent.ctx) === agent, "the deployment's scopeOf reads the fork-created agent scope key (no dual module instance)");
-	assert(agent.ctx.agent === agent, "the agent ctx exposes the agent");
+	// 0.2.1-rc.5 no longer exposes `ctx.agent` as a plain property (reading it
+	// throws "cannot get property \"agent\" without inject"). The supported way
+	// to resolve the owning agent from an agent-scoped context is the registry.
+	assert(typeof agent.ctx.agents?.requireInitiator === "function", "the agent ctx reaches the agent registry (requireInitiator path)");
 	await Promise.allSettled(fibers.map((fiber) => fiber.dispose()));
 }
 

@@ -5,11 +5,16 @@
 **Pause anything in DeepSeek Harness, then pick up right where you left off**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-22c55e.svg)](LICENSE)
-[![DeepSeek Harness](https://img.shields.io/badge/DeepSeek%20Harness-web%20bundle-4f46e5.svg)](https://github.com/watericetangcw/dsh-session-pause)
+[![DeepSeek Harness](https://img.shields.io/badge/DeepSeek%20Harness-web%20bundle-4f46e5.svg)](https://github.com/DL909/dsh-session-pause)
 
 **[简体中文](README.md) · English**
 
 </div>
+
+> **Compatibility**: this version targets `dsh@0.2.1-rc.5` (the bundled agent-loop fork is
+> aligned to that release). On any other dsh version it fails **silently** at startup —
+> module exports no longer match, so agent sessions stop working without an error.
+> Check `dsh --version` before installing.
 
 Install once, use forever: click **⏸ Pause** next to the send button, let the current turn finish gracefully (answer written, all tools run to completion), and the whole session is persisted — close or even restart DSH, come back and click **▶ Resume** to continue from the exact pause point, as if nothing ever stopped. **No DSH code is modified** — the entire feature is a drop-in profile bundle.
 
@@ -35,14 +40,14 @@ When the last turn in the session log ends `paused`, reopening the session after
 | Click ✕ (cancel pause) | Cancels the pause request; later runs go back to normal |
 | Click stop | Does **not** cancel the pause — it only aborts the current turn, and the spinner keeps waiting for the next pausable moment |
 
-> While paused the agent enters a `paused` state, so goal auto-rounds naturally never fire; they resume once you continue.
+> While paused the agent still reports status `idle` (`paused` is an internal phase, not a third `AgentStatus`), so the plugin explicitly disarms the goal's automatic rounds on pause and re-arms them on resume — no extra goal round is queued.
 
 ## 🚀 Quick install
 
 One command:
 
 ```powershell
-dsh plugin --profile web add github:watericetangcw/dsh-session-pause
+dsh plugin --profile web add github:DL909/dsh-session-pause
 ```
 
 Then restart `dsh web` and refresh the browser page once.
@@ -85,7 +90,7 @@ New messages you send while paused stay in the session and get claimed together 
 
 ## 🔗 Links
 
-- Repository: [github.com/watericetangcw/dsh-session-pause](https://github.com/watericetangcw/dsh-session-pause)
+- Repository: [github.com/DL909/dsh-session-pause](https://github.com/DL909/dsh-session-pause)
 
 ## 📄 License
 
